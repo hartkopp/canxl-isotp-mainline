@@ -257,7 +257,10 @@ static void isotp_rcv_ff(struct sock *sk, u8 *data, unsigned int datalen)
 		return;
 
 	/* get the used sender LL_DL from the (first) CAN frame data length */
-	so->rx.ll_dl = padlen(datalen);
+	if (xlmode(so))
+		so->rx.ll_dl = datalen;
+	else
+		so->rx.ll_dl = padlen(datalen);
 
 	/* CAN FD: the first frame uses the entire LL_DL length (no padding) */
 	if (datalen != so->rx.ll_dl)
@@ -412,23 +415,44 @@ static void isotp_rcv_cf(struct sock *sk, u8 *data, unsigned int datalen,
 	isotp_send_fc(sk, ae, ISOTP_FC_CTS);
 }
 
-/* check CC/FD frame and return the pointer to the frame data section */
+/* check CC/FD/XL frame and return the pointer to the frame data section */
 static u8 *isotp_check_frame_head(struct isotp_sock *so, struct sk_buff *skb,
 				  unsigned int *datalen)
 {
 	/* all types of CAN frames start at skb->data */
-	struct canfd_frame *cf = (struct canfd_frame *)skb->data;
+	union cfu *cu = (union cfu *)skb->data;
+
+	/* check CAN XL frame */
+	if (xlmode(so)) {
+		canid_t vcid = cu->xl.prio >> CANXL_VCID_OFFSET;
+
+		if (!can_is_canxl_skb(skb))
+			return NULL;
+
+		if ((cu->xl.prio & CANXL_PRIO_MASK) != so->rxid ||
+		    cu->xl.flags != so->xl.rx_flags ||
+		    cu->xl.af != so->xl.rx_addr ||
+		    cu->xl.sdt != CAN_CIA_ISO15765_2_SDT)
+			return NULL;
+
+		if ((vcid & CANXL_VCID_VAL_MASK) != so->xl.rx_vcid)
+			return NULL;
+
+		*datalen = cu->xl.len;
+
+		return (u8 *)&cu->xl.data;
+	}
 
 	/* check CAN CC/FD frame:
 	 * Strictly receive only frames with the configured MTU size
 	 * => clear separation of CAN2.0 / CAN FD transport channels
 	 */
-	if (cf->can_id != so->rxid || skb->len != so->ll.mtu)
+	if (cu->fd.can_id != so->rxid || skb->len != so->ll.mtu)
 		return NULL;
 
-	*datalen = cf->len;
+	*datalen = cu->fd.len;
 
-	return (u8 *)&cf->data;
+	return (u8 *)&cu->fd.data;
 }
 
 void isotp_rcv(struct sk_buff *skb, void *skdata)
@@ -474,7 +498,7 @@ void isotp_rcv(struct sk_buff *skb, void *skdata)
 		 *
 		 * As we do not have a rx.ll_dl configuration, we can only test
 		 * if the CAN frames payload length matches the LL_DL == 8
-		 * requirements - no matter if it's CAN 2.0 or CAN FD
+		 * requirements - no matter if it's CAN 2.0 or CAN FD or CAN XL
 		 */
 
 		/* get the SF_DL from the N_PCI byte */
@@ -484,7 +508,18 @@ void isotp_rcv(struct sk_buff *skb, void *skdata)
 			isotp_rcv_sf(sk, data, datalen,
 				     SF_PCI_SZ4 + ae, skb, sf_dl);
 		} else {
-			if (can_is_canfd_skb(skb)) {
+			if (xlmode(so)) {
+				/* isotp_check_frame_head() checked the rest */
+				if (sf_dl & N_PCI_SF_XL) {
+					/* use the low nibble content of N_PCI byte */
+					sf_dl &= 7;
+					sf_dl <<= 8;
+					/* add low byte of SF data length */
+					sf_dl |= *(data + SF_PCI_SZ4 + ae);
+					isotp_rcv_sf(sk, data, datalen,
+						     SF_PCI_SZ8 + ae, skb, sf_dl);
+				}
+			} else if (can_is_canfd_skb(skb)) {
 				/* We have a CAN FD frame and CAN_DL is greater than 8:
 				 * Only frames with the SF_DL == 0 ESC value are valid.
 				 *
